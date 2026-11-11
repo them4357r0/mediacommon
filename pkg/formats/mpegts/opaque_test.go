@@ -5,11 +5,14 @@ import (
 	"io"
 	"testing"
 
+	"github.com/asticode/go-astits"
+
 	"github.com/stretchr/testify/require"
 
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts/codecs"
+	"github.com/bluenviron/mediacommon/v2/pkg/formats/mpegts/substructs"
 )
 
 var (
@@ -85,7 +88,7 @@ func TestOpaqueRoundTrip(t *testing.T) {
 	require.NoError(t, w.Initialize())
 
 	// opaque units written before the first frame are ignored
-	require.NoError(t, w.WriteOpaque(id3, 1, []byte{1}))
+	require.NoError(t, w.WriteOpaque(id3, 1, 0, []byte{1}))
 
 	aac := []byte{0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c}
 	for i := range 5 {
@@ -97,10 +100,10 @@ func TestOpaqueRoundTrip(t *testing.T) {
 		err = w.WriteMPEG4Audio(audio, pts, [][]byte{aac})
 		require.NoError(t, err)
 
-		err = w.WriteOpaque(id3, pts, testID3Tag)
+		err = w.WriteOpaque(id3, pts, 0xFC, testID3Tag)
 		require.NoError(t, err)
 
-		err = w.WriteOpaque(scte, pts, sections[i%2])
+		err = w.WriteOpaque(scte, pts, 0, sections[i%2])
 		require.NoError(t, err)
 	}
 
@@ -151,12 +154,13 @@ func TestOpaqueRoundTrip(t *testing.T) {
 
 	r.OnDataH264(tracks[0], func(_ int64, _ int64, _ [][]byte) error { return nil })
 	r.OnDataMPEG4Audio(tracks[1], func(_ int64, _ [][]byte) error { return nil })
-	r.OnDataOpaque(tracks[2], func(pts int64, data []byte) error {
+	r.OnDataOpaque(tracks[2], func(pts int64, streamID uint8, data []byte) error {
+		require.Equal(t, uint8(0xFC), streamID)
 		id3PTS = append(id3PTS, pts)
 		id3Got = append(id3Got, data)
 		return nil
 	})
-	r.OnDataOpaque(tracks[3], func(pts int64, data []byte) error {
+	r.OnDataOpaque(tracks[3], func(pts int64, _ uint8, data []byte) error {
 		require.GreaterOrEqual(t, pts, int64(90000))
 		scteSeen = true
 		scteGot = append(scteGot, data)
@@ -179,4 +183,72 @@ func TestOpaqueRoundTrip(t *testing.T) {
 	for _, d := range id3Got {
 		require.Equal(t, testID3Tag, d)
 	}
+}
+
+func TestOpaqueNegativePTS(t *testing.T) {
+	video, audio, id3, _ := testOpaqueTracks()
+
+	var buf bytes.Buffer
+	w := &Writer{W: &buf, Tracks: []*Track{video, audio, id3}}
+	require.NoError(t, w.Initialize())
+
+	require.NoError(t, w.WriteH264(video, 90000, 90000, [][]byte{testH264SPS, {byte(h264.NALUTypeIDR), 1}}))
+	require.NoError(t, w.WriteOpaque(id3, -1920, 0xBD, testID3Tag))
+	require.NoError(t, w.WriteH264(video, 93000, 93000, [][]byte{testH264SPS, {byte(h264.NALUTypeIDR), 1}}))
+	require.NoError(t, w.WriteMPEG4Audio(audio, 93000, [][]byte{{0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c}}))
+
+	r, err := NewReader(bytes.NewReader(buf.Bytes()))
+	require.NoError(t, err)
+
+	var got []int64
+	r.OnDataOpaque(r.Tracks()[2], func(pts int64, streamID uint8, _ []byte) error {
+		require.Equal(t, uint8(0xBD), streamID)
+		got = append(got, pts)
+		return nil
+	})
+	r.OnDataH264(r.Tracks()[0], func(int64, int64, [][]byte) error { return nil })
+	r.OnDataMPEG4Audio(r.Tracks()[1], func(int64, [][]byte) error { return nil })
+	for {
+		err = r.Read()
+		if err == io.EOF {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.Equal(t, []int64{0x1FFFFFFFF + 1 - 1920}, got)
+}
+
+// opaque tracks must not change how other streams are detected.
+func TestOpaqueUnsupportedStaysUnsupported(t *testing.T) {
+	var buf bytes.Buffer
+	mux := astits.NewMuxer(t.Context(), &buf)
+	require.NoError(t, mux.AddElementaryStream(astits.PMTElementaryStream{
+		ElementaryPID: 256,
+		StreamType:    astits.StreamTypeH264Video,
+	}))
+	require.NoError(t, mux.AddElementaryStream(astits.PMTElementaryStream{
+		ElementaryPID: 257,
+		StreamType:    0x88, // not carried by any codec
+	}))
+	require.NoError(t, mux.AddElementaryStream(astits.PMTElementaryStream{
+		ElementaryPID: 258,
+		StreamType:    astits.StreamTypeMetadata, // opaque, since without KLV descriptor
+		ElementaryStreamDescriptors: []*astits.Descriptor{{
+			Length:  1,
+			Tag:     substructs.DescriptorTagMetadata,
+			Unknown: &astits.DescriptorUnknown{Content: []byte{0, 1, 2, 3}},
+		}},
+	}))
+	mux.SetPCRPID(256)
+	for range 2 {
+		_, err := mux.WriteTables()
+		require.NoError(t, err)
+	}
+
+	r, err := NewReader(&buf)
+	require.NoError(t, err)
+	require.Equal(t, &codecs.H264{}, r.Tracks()[0].Codec)
+	require.IsType(t, &codecs.Unsupported{}, r.Tracks()[1].Codec)
+	require.IsType(t, &codecs.Opaque{}, r.Tracks()[2].Codec)
+	require.Empty(t, r.ProgramDescriptors())
 }

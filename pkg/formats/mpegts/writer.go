@@ -364,7 +364,10 @@ func (w *Writer) WriteDVBSubtitle(
 }
 
 // WriteOpaque writes a unit of an Opaque track.
-// For tracks that carry PES packets, data is the PES payload, that is written with a PTS.
+// For tracks that carry PES packets, data is the PES payload, that is written with a PTS
+// (taken modulo 2^33, so that timestamps that are negative after a rebase are
+// represented as they are for any other 33-bit timestamp) and with the given stream_id
+// (when zero, private_stream_1 is used).
 // For tracks that carry sections, data must be one or more complete sections,
 // and pts is ignored since sections carry no timestamp.
 // Units are ignored until a video or audio frame has been written, since
@@ -372,9 +375,14 @@ func (w *Writer) WriteDVBSubtitle(
 func (w *Writer) WriteOpaque(
 	track *Track,
 	pts int64,
+	streamID uint8,
 	data []byte,
 ) error {
 	codec := track.Codec.(*codecs.Opaque)
+
+	if streamID == 0 {
+		streamID = streamIDPrivate
+	}
 
 	if !w.leadingTrackChosen {
 		return nil
@@ -396,9 +404,9 @@ func (w *Writer) WriteOpaque(
 				OptionalHeader: &astits.PESOptionalHeader{
 					MarkerBits:      2,
 					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
-					PTS:             &astits.ClockReference{Base: pts},
+					PTS:             &astits.ClockReference{Base: pts & 0x1FFFFFFFF},
 				},
-				StreamID: streamIDPrivate,
+				StreamID: streamID,
 			},
 			Data: data,
 		},

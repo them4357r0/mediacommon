@@ -62,7 +62,7 @@ type ReaderOnDataKLVFunc func(pts int64, data []byte) error
 type ReaderOnDataDVBSubtitleFunc func(pts int64, data []byte) error
 
 // ReaderOnDataOpaqueFunc is the prototype of the callback passed to OnDataOpaque.
-type ReaderOnDataOpaqueFunc func(pts int64, data []byte) error
+type ReaderOnDataOpaqueFunc func(pts int64, streamID uint8, data []byte) error
 
 func findPMT(dem *robustDemuxer) (*astits.PMTData, error) {
 	pmt, _, err := findPMTWithPID(dem)
@@ -207,6 +207,7 @@ type Reader struct {
 
 	tracks        []*Track
 	programDescs  []byte
+	lastStreamID  uint8
 	tracksByPID   map[uint16]*Track
 	preDem        *preDemuxer
 	dem           *robustDemuxer
@@ -611,7 +612,9 @@ func (r *Reader) OnDataKLV(track *Track, cb ReaderOnDataKLVFunc) {
 }
 
 // OnDataOpaque sets a callback that is called when data from an Opaque track is received.
-// For tracks that carry PES packets, data is the PES payload and pts is the PES PTS.
+// For tracks that carry PES packets, data is the PES payload, pts is the PES PTS
+// and streamID is the stream_id of the PES.
+// For tracks that carry sections streamID is zero.
 // For tracks that carry sections, data is a complete section, including the CRC,
 // and pts is the PTS of the last PES that has been received before the section
 // (sections that are received before any PES are dropped).
@@ -622,7 +625,7 @@ func (r *Reader) OnDataOpaque(track *Track, cb ReaderOnDataOpaqueFunc) {
 			return nil
 		}
 
-		return cb(pts, data)
+		return cb(pts, r.lastStreamID, data)
 	}
 }
 
@@ -656,6 +659,7 @@ func (r *Reader) Read() error {
 			return nil
 		}
 
+		r.lastStreamID = 0
 		return onData(*data.lastPTS, *data.lastPTS, data.Section)
 	}
 
@@ -699,6 +703,8 @@ func (r *Reader) Read() error {
 	if !ok {
 		return nil
 	}
+
+	r.lastStreamID = data.PES.Header.StreamID
 
 	return onData(pts, dts, data.PES.Data)
 }

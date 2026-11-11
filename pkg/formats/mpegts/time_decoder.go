@@ -44,3 +44,8 @@ func (d *TimeDecoder) Decode(ts int64) int64 {
 
 	return d.overall
 }
+
+// Initialized returns whether Decode() has been called at least once.
+func (d *TimeDecoder) Initialized() bool {
+	return d.initialized
+}

@@ -87,8 +87,8 @@ func TestOpaqueRoundTrip(t *testing.T) {
 	}
 	require.NoError(t, w.Initialize())
 
-	// opaque units written before the first frame are ignored
-	require.NoError(t, w.WriteOpaque(id3, 1, 0, []byte{1}))
+	// opaque units written before the first frame are written after it
+	require.NoError(t, w.WriteOpaque(id3, 1, 0xFC, testID3Tag))
 
 	aac := []byte{0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c}
 	for i := range 5 {
@@ -179,7 +179,7 @@ func TestOpaqueRoundTrip(t *testing.T) {
 	require.Equal(t, [][]byte{
 		sections[0], sections[1], sections[0], sections[1], sections[0],
 	}, scteGot)
-	require.Equal(t, []int64{90000, 93000, 96000, 99000, 102000}, id3PTS)
+	require.Equal(t, []int64{1, 90000, 93000, 96000, 99000, 102000}, id3PTS)
 	for _, d := range id3Got {
 		require.Equal(t, testID3Tag, d)
 	}

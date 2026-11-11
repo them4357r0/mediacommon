@@ -50,6 +50,18 @@ func mpeg1AudioMarshalSize(frames [][]byte) int {
 	return n
 }
 
+const (
+	maxPendingOpaqueUnits = 64
+	maxPendingOpaqueBytes = 256 * 1024
+)
+
+type pendingOpaqueUnit struct {
+	track    *Track
+	pts      int64
+	streamID uint8
+	data     []byte
+}
+
 // Writer is a MPEG-TS writer.
 type Writer struct {
 	W      io.Writer
@@ -62,6 +74,8 @@ type Writer struct {
 	nextPID            uint16
 	out                io.Writer
 	opaqueCC           map[uint16]uint8
+	pendingOpaque      []pendingOpaqueUnit
+	pendingOpaqueBytes int
 	mux                *astits.Muxer
 	pcrCounter         int
 	leadingTrackChosen bool
@@ -370,8 +384,8 @@ func (w *Writer) WriteDVBSubtitle(
 // (when zero, private_stream_1 is used).
 // For tracks that carry sections, data must be one or more complete sections,
 // and pts is ignored since sections carry no timestamp.
-// Units are ignored until a video or audio frame has been written, since
-// opaque tracks cannot carry the PCR.
+// Units written before the first video or audio frame (opaque tracks cannot carry the PCR)
+// are kept, up to 64 units and 256 KiB, and written after that frame; the exceeding ones are dropped.
 func (w *Writer) WriteOpaque(
 	track *Track,
 	pts int64,
@@ -385,9 +399,33 @@ func (w *Writer) WriteOpaque(
 	}
 
 	if !w.leadingTrackChosen {
+		// opaque tracks cannot carry the PCR, therefore units are kept until
+		// a video or audio frame has been written.
+		if len(w.pendingOpaque) < maxPendingOpaqueUnits && w.pendingOpaqueBytes+len(data) <= maxPendingOpaqueBytes {
+			w.pendingOpaque = append(w.pendingOpaque, pendingOpaqueUnit{track, pts, streamID, append([]byte(nil), data...)})
+			w.pendingOpaqueBytes += len(data)
+		}
 		return nil
 	}
 
+	return w.writeOpaque(track, codec, pts, streamID, data)
+}
+
+func (w *Writer) flushOpaque() error {
+	units := w.pendingOpaque
+	w.pendingOpaque = nil
+	w.pendingOpaqueBytes = 0
+
+	for _, u := range units {
+		err := w.writeOpaque(u.track, u.track.Codec.(*codecs.Opaque), u.pts, u.streamID, u.data)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Writer) writeOpaque(track *Track, codec *codecs.Opaque, pts int64, streamID uint8, data []byte) error {
 	if codec.Sections {
 		// astits.Muxer supports only PES packets, therefore packets are written directly.
 		// They are written through the same writer, in order to keep packets aligned.
@@ -470,7 +508,11 @@ func (w *Writer) writeVideo(
 			Data: data,
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	return w.flushOpaque()
 }
 
 func (w *Writer) writeAudio(track *Track, pts int64, data []byte) error {
@@ -508,7 +550,11 @@ func (w *Writer) writeAudio(track *Track, pts int64, data []byte) error {
 			Data: data,
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	return w.flushOpaque()
 }
 
 func (w *Writer) writeData(track *Track, hasPTS bool, pts int64, streamID uint8, data []byte) error {
@@ -553,5 +599,9 @@ func (w *Writer) writeData(track *Track, hasPTS bool, pts int64, streamID uint8,
 			Data:   data,
 		},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	return w.flushOpaque()
 }

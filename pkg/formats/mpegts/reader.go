@@ -61,17 +61,36 @@ type ReaderOnDataKLVFunc func(pts int64, data []byte) error
 // ReaderOnDataDVBSubtitleFunc is the prototype of the callback passed to OnDataDVBSubtitle.
 type ReaderOnDataDVBSubtitleFunc func(pts int64, data []byte) error
 
+// ReaderOnDataOpaqueFunc is the prototype of the callback passed to OnDataOpaque.
+type ReaderOnDataOpaqueFunc func(pts int64, data []byte) error
+
 func findPMT(dem *robustDemuxer) (*astits.PMTData, error) {
+	pmt, _, err := findPMTWithPID(dem)
+	return pmt, err
+}
+
+func findPMTWithPID(dem *robustDemuxer) (*astits.PMTData, uint16, error) {
 	for {
 		data, err := dem.nextData()
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 
 		if data.PMT != nil {
-			return data.PMT, nil
+			return data.PMT, data.PID, nil
 		}
 	}
+}
+
+// opaqueStreamTypes are the stream types, otherwise unsupported, that are exposed as codecs.Opaque.
+// The value tells whether the stream carries sections (true) or PES packets (false).
+var opaqueStreamTypes = map[uint8]bool{
+	// timed metadata carried in PES packets, i.e. timed ID3.
+	// Streams that carry KLV are exposed as codecs.KLV.
+	uint8(astits.StreamTypeMetadata): false,
+
+	// SCTE-35 splice information sections.
+	0x86: true,
 }
 
 func readMetadataAUWrapper(in []byte) ([]byte, error) {
@@ -187,6 +206,7 @@ type Reader struct {
 	R io.Reader
 
 	tracks        []*Track
+	programDescs  []byte
 	tracksByPID   map[uint16]*Track
 	preDem        *preDemuxer
 	dem           *robustDemuxer
@@ -202,10 +222,19 @@ func (r *Reader) Initialize() error {
 	preDem.initialize()
 	dem := &robustDemuxer{R: preDem}
 	dem.initialize()
+	dem.enablePSICapture()
 
-	pmt, err := findPMT(dem)
+	pmt, pmtPID, err := findPMTWithPID(dem)
 	if err != nil {
 		return err
+	}
+
+	// raw PMT, needed to read descriptors verbatim.
+	// If it's not available, opaque streams are not detected.
+	var rawPMT rawPMT
+	hasRawPMT := false
+	if raw, ok := dem.ptsInterceptor.rawPMTs[pmtPID]; ok {
+		hasRawPMT = rawPMT.unmarshal(raw) == nil
 	}
 
 	tracks := make([]*Track, len(pmt.ElementaryStreams))
@@ -217,10 +246,19 @@ func (r *Reader) Initialize() error {
 			return err
 		}
 
+		if _, ok := track.Codec.(*codecs.Unsupported); ok && hasRawPMT {
+			if opaque := findOpaqueCodec(&rawPMT, es); opaque != nil {
+				track.Codec = opaque
+			}
+		}
+
 		tracks[i] = &track
 	}
 
 	r.tracks = tracks
+	if hasRawPMT {
+		r.programDescs = rawPMT.ProgramInfo
+	}
 
 	r.tracksByPID = make(map[uint16]*Track)
 	for _, track := range tracks {
@@ -233,6 +271,16 @@ func (r *Reader) Initialize() error {
 	r.preDem.initialize()
 	r.dem = &robustDemuxer{R: r.preDem}
 	r.dem.initialize()
+
+	var sectionPIDs []uint16
+	for _, track := range tracks {
+		if opaque, ok := track.Codec.(*codecs.Opaque); ok && opaque.Sections {
+			sectionPIDs = append(sectionPIDs, track.PID)
+		}
+	}
+	if len(sectionPIDs) != 0 {
+		r.dem.captureSections(sectionPIDs)
+	}
 
 	r.onDecodeError = func(_ error) {}
 	r.onData = make(map[uint16]func(int64, int64, []byte) error)
@@ -249,6 +297,30 @@ func NewReader(br io.Reader) (*Reader, error) {
 	}
 	err := r.Initialize()
 	return r, err
+}
+
+func findOpaqueCodec(pmt *rawPMT, es *astits.PMTElementaryStream) *codecs.Opaque {
+	sections, ok := opaqueStreamTypes[uint8(es.StreamType)]
+	if !ok {
+		return nil
+	}
+
+	for _, rs := range pmt.Streams {
+		if rs.PID == es.ElementaryPID && rs.StreamType == uint8(es.StreamType) {
+			return &codecs.Opaque{
+				StreamType:  rs.StreamType,
+				Descriptors: rs.Descriptors,
+				Sections:    sections,
+			}
+		}
+	}
+	return nil
+}
+
+// ProgramDescriptors returns the raw descriptor loop of the program (program_info of the PMT).
+// It is empty when the program has no descriptors, or when the PMT could not be read verbatim.
+func (r *Reader) ProgramDescriptors() []byte {
+	return r.programDescs
 }
 
 // Tracks returns detected tracks.
@@ -538,6 +610,22 @@ func (r *Reader) OnDataKLV(track *Track, cb ReaderOnDataKLVFunc) {
 	}
 }
 
+// OnDataOpaque sets a callback that is called when data from an Opaque track is received.
+// For tracks that carry PES packets, data is the PES payload and pts is the PES PTS.
+// For tracks that carry sections, data is a complete section, including the CRC,
+// and pts is the PTS of the last PES that has been received before the section
+// (sections that are received before any PES are dropped).
+func (r *Reader) OnDataOpaque(track *Track, cb ReaderOnDataOpaqueFunc) {
+	r.onData[track.PID] = func(pts int64, _ int64, data []byte) error {
+		if len(data) == 0 {
+			r.onDecodeError(fmt.Errorf("empty opaque payload"))
+			return nil
+		}
+
+		return cb(pts, data)
+	}
+}
+
 // OnDataDVBSubtitle sets a callback that is called when data from a DVB subtitle track is received.
 func (r *Reader) OnDataDVBSubtitle(track *Track, cb ReaderOnDataDVBSubtitleFunc) {
 	r.onData[track.PID] = func(pts int64, _ int64, data []byte) error {
@@ -555,6 +643,20 @@ func (r *Reader) Read() error {
 	data, err := r.dem.nextData()
 	if err != nil {
 		return err
+	}
+
+	if data.Section != nil {
+		if data.lastPTS == nil {
+			r.onDecodeError(fmt.Errorf("section received before any PTS"))
+			return nil
+		}
+
+		onData, ok := r.onData[data.PID]
+		if !ok {
+			return nil
+		}
+
+		return onData(*data.lastPTS, *data.lastPTS, data.Section)
 	}
 
 	if data.PES == nil {

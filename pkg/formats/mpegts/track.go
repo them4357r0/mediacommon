@@ -555,6 +555,14 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 			}
 		}
 
+	case *codecs.Opaque:
+		// descriptors are not set here since astits is not able to write them verbatim.
+		// They are inserted by Writer when the PMT is written.
+		es = &astits.PMTElementaryStream{
+			ElementaryPID: t.PID,
+			StreamType:    astits.StreamType(c.StreamType),
+		}
+
 	case *codecs.DVBSubtitle:
 		es = &astits.PMTElementaryStream{
 			ElementaryPID: t.PID,
@@ -576,7 +584,8 @@ func (t Track) marshal() (*astits.PMTElementaryStream, error) {
 		panic("unsupported codec")
 	}
 
-	if t.Language != "" {
+	// Opaque tracks keep their descriptors verbatim, including the language.
+	if _, ok := t.Codec.(*codecs.Opaque); !ok && t.Language != "" {
 		es.ElementaryStreamDescriptors = append(es.ElementaryStreamDescriptors, &astits.Descriptor{
 			// 3 bytes language + 1 byte audio_type = 4 bytes
 			Length: 4,

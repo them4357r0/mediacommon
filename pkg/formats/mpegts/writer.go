@@ -55,7 +55,13 @@ type Writer struct {
 	W      io.Writer
 	Tracks []*Track
 
+	// Raw descriptor loop of the program (program_info of the PMT), written verbatim.
+	// It is optional.
+	ProgramDescriptors []byte
+
 	nextPID            uint16
+	out                io.Writer
+	opaqueCC           map[uint16]uint8
 	mux                *astits.Muxer
 	pcrCounter         int
 	leadingTrackChosen bool
@@ -65,15 +71,34 @@ type Writer struct {
 func (w *Writer) Initialize() error {
 	w.nextPID = 256
 
-	w.mux = astits.NewMuxer(
-		context.Background(),
-		w.W)
+	w.out = w.W
 
+	streamDescs := make(map[uint16][]byte)
 	for _, track := range w.Tracks {
 		if track.PID == 0 {
 			track.PID = w.nextPID
 			w.nextPID++
 		}
+		if c, ok := track.Codec.(*codecs.Opaque); ok {
+			streamDescs[track.PID] = c.Descriptors
+		}
+	}
+
+	if len(streamDescs) != 0 || len(w.ProgramDescriptors) != 0 {
+		w.out = &pmtRewriter{
+			W:            w.W,
+			programDescs: w.ProgramDescriptors,
+			streamDescs:  streamDescs,
+		}
+	}
+
+	w.opaqueCC = make(map[uint16]uint8)
+
+	w.mux = astits.NewMuxer(
+		context.Background(),
+		w.out)
+
+	for _, track := range w.Tracks {
 		es, _ := track.marshal()
 
 		err := w.mux.AddElementaryStream(*es)
@@ -336,6 +361,49 @@ func (w *Writer) WriteDVBSubtitle(
 	data []byte,
 ) error {
 	return w.writeData(track, true, pts, streamIDPrivate, data)
+}
+
+// WriteOpaque writes a unit of an Opaque track.
+// For tracks that carry PES packets, data is the PES payload, that is written with a PTS.
+// For tracks that carry sections, data must be one or more complete sections,
+// and pts is ignored since sections carry no timestamp.
+// Units are ignored until a video or audio frame has been written, since
+// opaque tracks cannot carry the PCR.
+func (w *Writer) WriteOpaque(
+	track *Track,
+	pts int64,
+	data []byte,
+) error {
+	codec := track.Codec.(*codecs.Opaque)
+
+	if !w.leadingTrackChosen {
+		return nil
+	}
+
+	if codec.Sections {
+		// astits.Muxer supports only PES packets, therefore packets are written directly.
+		// They are written through the same writer, in order to keep packets aligned.
+		pkts, cc := packetizeSection(track.PID, w.opaqueCC[track.PID], data)
+		w.opaqueCC[track.PID] = cc
+		_, err := w.out.Write(pkts)
+		return err
+	}
+
+	_, err := w.mux.WriteData(&astits.MuxerData{
+		PID: track.PID,
+		PES: &astits.PESData{
+			Header: &astits.PESHeader{
+				OptionalHeader: &astits.PESOptionalHeader{
+					MarkerBits:      2,
+					PTSDTSIndicator: astits.PTSDTSIndicatorOnlyPTS,
+					PTS:             &astits.ClockReference{Base: pts},
+				},
+				StreamID: streamIDPrivate,
+			},
+			Data: data,
+		},
+	})
+	return err
 }
 
 func (w *Writer) writeVideo(

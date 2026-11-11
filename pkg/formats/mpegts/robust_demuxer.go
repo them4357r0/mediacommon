@@ -59,11 +59,65 @@ func (r *errorWrapper) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// capturedSection is a section received on a PID that has been registered with captureSections.
+type capturedSection struct {
+	pid     uint16
+	lastPTS *int64
+	data    []byte
+}
+
 type ptsInterceptor struct {
 	R io.Reader
 
 	hasLastPTS bool
 	lastPTS    int64
+
+	// raw PSI capture, used to read PMT descriptors verbatim.
+	capturePSI bool
+	patAsm     sectionAssembler
+	pmtAsms    map[uint16]*sectionAssembler
+	rawPMTs    map[uint16][]byte
+
+	// private section capture, used for streams that carry sections.
+	sectionAsms map[uint16]*sectionAssembler
+	sections    []capturedSection
+}
+
+func (r *ptsInterceptor) capturePacket(p []byte) {
+	pid := uint16(p[1]&0x1F)<<8 | uint16(p[2])
+
+	if r.capturePSI {
+		if pid == pidPAT {
+			for _, sec := range r.patAsm.push(p) {
+				pmtPIDs, err := parsePAT(sec)
+				if err != nil {
+					continue
+				}
+				for _, pmtPID := range pmtPIDs {
+					if _, ok := r.pmtAsms[pmtPID]; !ok {
+						r.pmtAsms[pmtPID] = &sectionAssembler{}
+					}
+				}
+			}
+		} else if asm, ok := r.pmtAsms[pid]; ok {
+			for _, sec := range asm.push(p) {
+				if len(sec) > 0 && sec[0] == tableIDPMT && crc32MPEG(sec) == 0 {
+					r.rawPMTs[pid] = sec
+				}
+			}
+		}
+	}
+
+	if asm, ok := r.sectionAsms[pid]; ok {
+		for _, sec := range asm.push(p) {
+			cs := capturedSection{pid: pid, data: sec}
+			if r.hasLastPTS {
+				pts := r.lastPTS
+				cs.lastPTS = &pts
+			}
+			r.sections = append(r.sections, cs)
+		}
+	}
 }
 
 func (r *ptsInterceptor) Read(p []byte) (int, error) {
@@ -77,6 +131,10 @@ func (r *ptsInterceptor) Read(p []byte) (int, error) {
 	}
 
 	if p[0] == syncByte {
+		if r.capturePSI || len(r.sectionAsms) != 0 {
+			r.capturePacket(p)
+		}
+
 		hasPayload := (p[3]&0x10 > 0)
 		payloadStartIndicator := (p[1]&0x40 > 0)
 
@@ -117,6 +175,7 @@ type robustDemuxerData struct {
 	PID     uint16
 	PMT     *astits.PMTData
 	PES     *astits.PESData
+	Section []byte // complete private section, only for PIDs registered with captureSections
 }
 
 type robustDemuxer struct {
@@ -125,6 +184,8 @@ type robustDemuxer struct {
 
 	dem            *astits.Demuxer
 	ptsInterceptor *ptsInterceptor
+	pending        []*robustDemuxerData
+	pendingErr     error
 }
 
 func (d *robustDemuxer) initialize() {
@@ -142,7 +203,61 @@ func (d *robustDemuxer) initialize() {
 	)
 }
 
+// enablePSICapture makes the demuxer keep the raw PMT of each program.
+func (d *robustDemuxer) enablePSICapture() {
+	d.ptsInterceptor.capturePSI = true
+	d.ptsInterceptor.pmtAsms = make(map[uint16]*sectionAssembler)
+	d.ptsInterceptor.rawPMTs = make(map[uint16][]byte)
+}
+
+// captureSections makes the demuxer return the sections that are carried by the given PIDs.
+// They are returned in robustDemuxerData.Section, in the order they are received,
+// and with the PTS of the last PES that preceded them.
+func (d *robustDemuxer) captureSections(pids []uint16) {
+	d.ptsInterceptor.sectionAsms = make(map[uint16]*sectionAssembler)
+	for _, pid := range pids {
+		d.ptsInterceptor.sectionAsms[pid] = &sectionAssembler{}
+	}
+}
+
 func (d *robustDemuxer) nextData() (*robustDemuxerData, error) {
+	if len(d.pending) != 0 {
+		data := d.pending[0]
+		d.pending = d.pending[1:]
+		return data, nil
+	}
+
+	if d.pendingErr != nil {
+		return nil, d.pendingErr
+	}
+
+	data, err := d.nextDataInner()
+
+	// sections completed while reading are returned after the data (that is a PES
+	// completed by the packets that have just been read) and before an error.
+	if len(d.ptsInterceptor.sections) != 0 {
+		d.pending = d.pending[:0]
+		for _, sec := range d.ptsInterceptor.sections {
+			d.pending = append(d.pending, &robustDemuxerData{
+				lastPTS: sec.lastPTS,
+				PID:     sec.pid,
+				Section: sec.data,
+			})
+		}
+		d.ptsInterceptor.sections = nil
+
+		if err != nil {
+			d.pendingErr = err
+			data = d.pending[0]
+			d.pending = d.pending[1:]
+			return data, nil
+		}
+	}
+
+	return data, err
+}
+
+func (d *robustDemuxer) nextDataInner() (*robustDemuxerData, error) {
 	for {
 		data, err := d.dem.NextData()
 		if err != nil {

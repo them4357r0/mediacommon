@@ -81,7 +81,21 @@ type ptsInterceptor struct {
 	// private section capture, used for streams that carry sections.
 	sectionAsms map[uint16]*sectionAssembler
 	sections    []capturedSection
+
+	// sections are drained by robustDemuxer.nextData once a full PAT/PMT/PES completes, so a
+	// publisher that only sends sections could grow them without bound: they are capped.
+	sectionBytes    int
+	droppedSections uint64
 }
+
+const (
+	// maximum number of captured sections that wait to be drained.
+	maxPendingSections = 64
+	// maximum total size of captured sections that wait to be drained.
+	maxPendingSectionBytes = 64 * 1024
+	// a section that cannot hold the 3-byte header and the CRC32 is invalid.
+	minSectionSize = 3 + 4
+)
 
 func (r *ptsInterceptor) capturePacket(p []byte) {
 	pid := uint16(p[1]&0x1F)<<8 | uint16(p[2])
@@ -110,6 +124,13 @@ func (r *ptsInterceptor) capturePacket(p []byte) {
 
 	if asm, ok := r.sectionAsms[pid]; ok {
 		for _, sec := range asm.push(p) {
+			if len(sec) < minSectionSize ||
+				len(r.sections) >= maxPendingSections ||
+				r.sectionBytes+len(sec) > maxPendingSectionBytes {
+				r.droppedSections++
+				continue
+			}
+			r.sectionBytes += len(sec)
 			cs := capturedSection{pid: pid, data: sec}
 			if r.hasLastPTS {
 				pts := r.lastPTS
@@ -186,6 +207,14 @@ type robustDemuxer struct {
 	ptsInterceptor *ptsInterceptor
 	pending        []*robustDemuxerData
 	pendingErr     error
+
+	reportedDropped uint64
+}
+
+// DroppedSections returns the number of captured private sections that have been dropped
+// because they were too short to hold a CRC or because the capture buffer was full.
+func (d *robustDemuxer) DroppedSections() uint64 {
+	return d.ptsInterceptor.droppedSections
 }
 
 func (d *robustDemuxer) initialize() {
@@ -233,6 +262,11 @@ func (d *robustDemuxer) nextData() (*robustDemuxerData, error) {
 
 	data, err := d.nextDataInner()
 
+	if n := d.ptsInterceptor.droppedSections; n != d.reportedDropped {
+		d.OnDecodeError(fmt.Errorf("dropped %d private sections (too short or buffer full)", n-d.reportedDropped))
+		d.reportedDropped = n
+	}
+
 	// sections completed while reading are returned after the data (that is a PES
 	// completed by the packets that have just been read) and before an error.
 	if len(d.ptsInterceptor.sections) != 0 {
@@ -245,6 +279,7 @@ func (d *robustDemuxer) nextData() (*robustDemuxerData, error) {
 			})
 		}
 		d.ptsInterceptor.sections = nil
+		d.ptsInterceptor.sectionBytes = 0
 
 		if err != nil {
 			d.pendingErr = err
